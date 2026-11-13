@@ -3,14 +3,18 @@ name: Build PMWeather Tornado Addon
 'on':
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
     paths:
+      - '*.zip'
+      - '**/*.zip'
       - '**/*.java'
       - '**/*.toml'
       - '**/*.json'
       - '**/*.ogg'
       - 'build.gradle'
+      - 'build.gradle.kts'
       - 'settings.gradle'
+      - 'settings.gradle.kts'
       - 'gradle.properties'
       - '.github/workflows/main.yml'
 
@@ -20,8 +24,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Java 21
@@ -30,19 +35,94 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Install ZIP tools
+        run: sudo apt-get update && sudo apt-get install -y unzip zip
+
+      # If the repository already contains the Gradle project, use it.
+      # Otherwise, find and extract the source ZIP uploaded to the repository.
+      - name: Locate or extract Gradle project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR=""
+
+          # First check the repository root and its existing subfolders.
+          ROOT_BUILD="$(find . -type f \( -name build.gradle -o -name build.gradle.kts \) \
+            -not -path './.git/*' \
+            -not -path '*/.gradle/*' \
+            -not -path '*/build/*' \
+            -print -quit || true)"
+
+          if [ -n "$ROOT_BUILD" ]; then
+            PROJECT_DIR="$(dirname "$ROOT_BUILD")"
+            echo "Found Gradle project already checked out: $PROJECT_DIR"
+          else
+            echo "No Gradle project in repository. Searching source ZIP files..."
+            mkdir -p "$GITHUB_WORKSPACE/.build-source"
+            FOUND=false
+
+            while IFS= read -r -d '' ZIP_FILE; do
+              echo "Checking archive: $ZIP_FILE"
+              CANDIDATE="$GITHUB_WORKSPACE/.build-source/candidate"
+              rm -rf "$CANDIDATE"
+              mkdir -p "$CANDIDATE"
+
+              if ! unzip -q "$ZIP_FILE" -d "$CANDIDATE"; then
+                echo "Skipping invalid ZIP: $ZIP_FILE"
+                continue
+              fi
+
+              BUILD_FILE="$(find "$CANDIDATE" -type f \
+                \( -name build.gradle -o -name build.gradle.kts \) \
+                -not -path '*/.gradle/*' \
+                -not -path '*/build/*' \
+                -print -quit || true)"
+
+              if [ -n "$BUILD_FILE" ]; then
+                PROJECT_DIR="$(dirname "$BUILD_FILE")"
+                echo "Found Gradle project in archive: $PROJECT_DIR"
+                FOUND=true
+                break
+              fi
+            done < <(find . -maxdepth 3 -type f -iname '*.zip' \
+              -not -path './.git/*' -print0 | sort -z)
+
+            if [ "$FOUND" != true ]; then
+              echo "::error::No Gradle project found. Repository root has no build.gradle, and no ZIP contains build.gradle/build.gradle.kts."
+              echo "Repository files:"
+              find . -maxdepth 3 -type f | sort | head -200
+              exit 1
+            fi
+          fi
+
+          if [ ! -f "$PROJECT_DIR/settings.gradle" ] && [ ! -f "$PROJECT_DIR/settings.gradle.kts" ]; then
+            echo "::warning::settings.gradle was not found; Gradle will use the discovered build file directory."
+          fi
+
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Gradle project directory: $PROJECT_DIR"
+          echo "Build files:"
+          ls -la "$PROJECT_DIR"
+
       - name: Set up Gradle 8.12.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.12.1'
-          cache-disabled: false
+          cache-disabled: true
 
       - name: Compile addon
-        run: gradle clean build --no-daemon --stacktrace
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          echo "Building from: $(pwd)"
+          test -f build.gradle || test -f build.gradle.kts
+          gradle clean build --no-daemon --stacktrace
 
-      - name: Upload addon JAR
-        uses: actions/upload-artifact@v4
-        with:
-          name: PMWeather-Tornado-Addon-1.21.1
-          path: build/libs/*.jar
-          if-no-files-found: error
-          retention-days: 14
+      - name: Collect addon JAR
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
